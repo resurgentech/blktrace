@@ -256,8 +256,8 @@ static void print_field(char *act, struct per_cpu_info *pci,
 		break;
 	case 'u':
 		if (elapsed == -1ULL) {
-			fprintf(stderr, "Expecting elapsed value\n");
-			exit(1);
+			fprintf(ofp, strcat(format, "llu"), 0);
+			break;
 		}
 		fprintf(ofp, strcat(format, "llu"), elapsed / 1000);
 		break;
