@@ -3,8 +3,12 @@
 
 #include <stdio.h>
 #include <limits.h>
+#if defined(WIN32)
+#include "blktrace-win32.h"
+#else
 #include <byteswap.h>
 #include <endian.h>
+#endif
 #include <sys/types.h>
 
 #include "blktrace_api.h"

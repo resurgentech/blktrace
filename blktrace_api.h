@@ -1,7 +1,15 @@
 #ifndef BLKTRACEAPI_H
 #define BLKTRACEAPI_H
 
+#if defined(WIN32)
+#define __u8 unsigned char
+#define __u16 unsigned short
+#define __u32 unsigned long
+#define __u64 unsigned long long
+#define caddr_t void *
+#else
 #include <asm/types.h>
+#endif
 
 /*
  * Trace categories
