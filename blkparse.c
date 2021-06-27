@@ -286,6 +286,7 @@ static int trace_rb_insert_last(struct per_dev_info *, struct trace *);
 FILE *ofp = NULL;
 static char *output_name;
 static char *input_dir;
+static char *input_file;
 
 static unsigned long long genesis_time;
 static unsigned long long last_allowed_time;
@@ -2409,6 +2410,42 @@ static int read_data(int fd, void *buffer, int bytes, int block, int *fdblock)
 	return 0;
 }
 
+static int input_read_data(FILE *fd, void *buffer, int bytes)
+{
+	int ret, bytes_left, fl;
+	void *p;
+
+	bytes_left = bytes;
+	p = buffer;
+	while (bytes_left > 0) {
+		ret = fread(p, 1, bytes_left, fd);
+		if (!ret)
+			return 1;
+		else if (ret < 0) {
+			if (errno != EAGAIN) {
+				perror("read");
+				return -1;
+			}
+
+			/*
+			 * never do partial reads. we can return if we
+			 * didn't read anything and we should not block,
+			 * otherwise wait for data
+			 */
+			if (bytes_left == bytes)
+				return 1;
+
+			usleep(10);
+			continue;
+		} else {
+			p += ret;
+			bytes_left -= ret;
+		}
+	}
+
+	return 0;
+}
+
 static inline __u16 get_pdulen(struct blk_io_trace *bit)
 {
 	if (data_is_native)
@@ -2466,6 +2503,90 @@ static int read_events(int fd, int always_block, int *fdblock)
 			void *ptr = realloc(bit, sizeof(*bit) + pdu_len);
 
 			if (read_data(fd, ptr + sizeof(*bit), pdu_len, 1, fdblock)) {
+				bit_free(ptr);
+				break;
+			}
+
+			bit = ptr;
+		}
+
+		trace_to_cpu(bit);
+
+		if (verify_trace(bit)) {
+			bit_free(bit);
+			continue;
+		}
+
+		/*
+		 * not a real trace, so grab and handle it here
+		 */
+		if (bit->action & BLK_TC_ACT(BLK_TC_NOTIFY) && (bit->action & ~__BLK_TN_CGROUP) != BLK_TN_MESSAGE) {
+			handle_notify(bit);
+			output_binary(bit, sizeof(*bit) + bit->pdu_len);
+			continue;
+		}
+
+		t = t_alloc();
+		memset(t, 0, sizeof(*t));
+		t->bit = bit;
+		t->read_sequence = read_sequence;
+
+		t->next = trace_list;
+		trace_list = t;
+
+		if (!pdi || pdi->dev != bit->device)
+			pdi = get_dev_info(bit->device);
+
+		if (bit->time > pdi->last_read_time)
+			pdi->last_read_time = bit->time;
+
+		events++;
+	}
+
+	return events;
+}
+
+static int input_read_events(FILE *fd)
+{
+	struct per_dev_info *pdi = NULL;
+	unsigned int events = 0;
+
+	while (!is_done() && events < rb_batch) {
+		struct blk_io_trace *bit;
+		struct trace *t;
+		int pdu_len, should_block, ret;
+		__u32 magic;
+
+		bit = bit_alloc();
+
+		should_block = !events;
+
+		ret = input_read_data(fd, bit, sizeof(*bit));
+		if (ret) {
+			bit_free(bit);
+			if (!events && ret < 0)
+				events = ret;
+			break;
+		}
+
+		/*
+		 * look at first trace to check whether we need to convert
+		 * data in the future
+		 */
+		if (data_is_native == -1 && check_data_endianness(bit->magic))
+			break;
+
+		magic = get_magic(bit);
+		if ((magic & 0xffffff00) != BLK_IO_TRACE_MAGIC) {
+			fprintf(stderr, "Bad magic %x\n", magic);
+			break;
+		}
+
+		pdu_len = get_pdulen(bit);
+		if (pdu_len) {
+			void *ptr = realloc(bit, sizeof(*bit) + pdu_len);
+
+			if (input_read_data(fd, ptr + sizeof(*bit), pdu_len)) {
 				bit_free(ptr);
 				break;
 			}
@@ -2829,6 +2950,40 @@ static int do_file(void)
 	return 0;
 }
 
+static int do_inputfile(void)
+{
+	FILE *fd;
+	unsigned long long youngest;
+	int events, fdblock;
+
+	fd = fopen(input_file, "rb");
+
+	if (fd == -1) {
+		perror("can't open");
+		return -1;
+	}
+
+	last_allowed_time = -1ULL;
+	fdblock = 1;
+	while ((events = input_read_events(fd)) > 0) {
+		read_sequence++;
+	
+		if (sort_entries(&youngest))
+			break;
+
+		if (youngest > stopwatch_end)
+			break;
+
+		show_entries_rb(0);
+	}
+
+	if (rb_sort_entries)
+		show_entries_rb(1);
+
+	fclose(fd);
+	return 0;
+}
+
 static void do_pipe(int fd)
 {
 	unsigned long long youngest;
@@ -2988,9 +3143,10 @@ static int get_program_sort_event(const char *str)
 	return 0;
 }
 
-#define S_OPTS  "a:A:b:D:d:f:F:hi:o:OqsS:tw:vVM"
+#define S_OPTS  "a:A:b:D:d:f:F:hi:I:o:OqsS:tw:vVM"
 static char usage_str[] =    "\n\n" \
 	"-i <file>           | --input=<file>\n" \
+	"-I <file>           | --inputfile=<file>\n" \
 	"[ -a <action field> | --act-mask=<action field> ]\n" \
 	"[ -A <action mask>  | --set-mask=<action mask> ]\n" \
 	"[ -b <traces>       | --batch=<traces> ]\n" \
@@ -3048,6 +3204,8 @@ int main(int argc, char *argv[])
 	char *ofp_buffer = NULL;
 	char *bin_ofp_buffer = NULL;
 
+	input_file = NULL;
+
 	while ((c = getopt_long(argc, argv, S_OPTS, l_opts, NULL)) != -1) {
 		switch (c) {
 		case 'a':
@@ -3076,6 +3234,9 @@ int main(int argc, char *argv[])
 				pipename = strdup(optarg);
 			} else if (resize_devices(optarg) != 0)
 				return 1;
+			break;
+		case 'I':
+			input_file = optarg;
 			break;
 		case 'D':
 			input_dir = optarg;
@@ -3146,7 +3307,7 @@ int main(int argc, char *argv[])
 		optind++;
 	}
 
-	if (!pipeline && !ndevices) {
+	if (!pipeline && !ndevices && !input_file) {
 		usage(argv[0]);
 		return 1;
 	}
@@ -3206,6 +3367,8 @@ int main(int argc, char *argv[])
 
 	if (pipeline)
 		ret = do_fifo();
+	else if (input_file)
+		ret = do_inputfile();
 	else
 		ret = do_file();
 
